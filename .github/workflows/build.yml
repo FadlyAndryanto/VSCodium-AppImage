@@ -31,12 +31,34 @@ jobs:
             xvfb
 
       - name: Download VSCodium .deb and pkgforge-dev/appimagetool
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p build && cd build
           curl -fSL "https://github.com/VSCodium/vscodium/releases/download/${VERSION}/codium_${VERSION}_amd64.deb" -o codium.deb
-          curl -fSL "https://github.com/pkgforge-dev/appimagetool/releases/latest/download/appimagetool-x86_64.AppImage" -o appimagetool.AppImage
-          chmod +x appimagetool.AppImage
-          ./appimagetool.AppImage --appimage-extract
+          APPIMAGETOOL_URL=$(python3 -c '
+          import json, os, urllib.request
+          req = urllib.request.Request(
+              "https://api.github.com/repos/pkgforge-dev/appimagetool/releases",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ[\"GITHUB_TOKEN\"]}",
+                  "User-Agent": "github-actions"
+              }
+          )
+          with urllib.request.urlopen(req) as resp:
+              releases = json.load(resp)
+          for rel in releases:
+              for asset in rel.get("assets", []):
+                  if asset["name"] == "appimagetool-full-x86_64-linux":
+                      print(asset["browser_download_url"])
+                      raise SystemExit(0)
+
+          raise SystemExit("appimagetool-full-x86_64-linux not found in releases")
+          ')
+          echo "Downloading appimagetool from: $APPIMAGETOOL_URL"
+          curl -fSL "$APPIMAGETOOL_URL" -o appimagetool
+          chmod +x appimagetool
 
       - name: Assemble AppDir
         run: |
@@ -60,10 +82,20 @@ jobs:
           EOF
           chmod +x VSCodium.AppDir/AppRun
 
-      - name: Build initial DwarFS AppImage for profiling
+      - name: Build initial DwarFS AppImage and capture bundled mkdwarfs
         run: |
           cd build
-          ./squashfs-root/AppRun --comp dwarfs --no-appstream VSCodium.AppDir VSCodium-initial.AppImage
+          ./appimagetool --comp dwarfs --no-appstream VSCodium.AppDir VSCodium-initial.AppImage &
+          APPTOOL_PID=$!
+          while kill -0 "$APPTOOL_PID" 2>/dev/null; do
+            MK_PID=$(pgrep -n mkdwarfs || true)
+            if [ -n "$MK_PID" ] && [ ! -f ./mkdwarfs ]; then
+              cp "/proc/$MK_PID/exe" ./mkdwarfs 2>/dev/null && chmod +x ./mkdwarfs || true
+            fi
+            sleep 0.2
+          done
+          wait "$APPTOOL_PID"
+          test -x ./mkdwarfs
 
       - name: Profile startup file access order
         run: |
@@ -73,7 +105,7 @@ jobs:
             export DWARFS_ANALYSIS_FILE="$PWD/vscodium.profile"
             ./VSCodium-initial.AppImage --no-sandbox --user-data-dir="$PWD/profile-userdata" &
             sleep 15
-            pkill -f "codium" || true
+            pkill -f "[.]mount_VSCodi" || true
             sleep 3
           '
           fusermount -u /tmp/.mount_VSCodi* 2>/dev/null || true
@@ -87,8 +119,7 @@ jobs:
         run: |
           cd build
           OUTPUT="VSCodium-${VERSION}-x86_64.AppImage"
-          MKDWARFS=$(find squashfs-root -type f -name 'mkdwarfs' | head -n 1)
-          "$MKDWARFS" \
+          ./mkdwarfs \
             -i VSCodium.AppDir \
             -o vscodium.dwarfs \
             -l 9 \
@@ -100,20 +131,15 @@ jobs:
             --set-owner=0 \
             --set-group=0 \
             --no-progress
-          URUNTIME=$(find squashfs-root -type f -name 'uruntime*' | head -n 1)
-          if [ -z "$URUNTIME" ]; then
-            ELF_SIZE=$(python3 -c '
-          import struct
+          python3 -c '
           with open("VSCodium-initial.AppImage", "rb") as f:
-              hdr = f.read(64)
-              e_shoff = struct.unpack_from("<Q", hdr, 40)[0]
-              e_shentsize, e_shnum = struct.unpack_from("<HH", hdr, 58)
-              print(e_shoff + e_shentsize * e_shnum)
-          ')
-            head -c "$ELF_SIZE" VSCodium-initial.AppImage > uruntime.bin
-            URUNTIME="uruntime.bin"
-          fi
-          cat "$URUNTIME" vscodium.dwarfs > "$OUTPUT"
+              data = f.read()
+          offset = data.find(b"DWARFS\x02", 4096)
+          assert offset > 0, "DwarFS superblock header not found"
+          with open("uruntime.bin", "wb") as out:
+              out.write(data[:offset])
+          '
+          cat uruntime.bin vscodium.dwarfs > "$OUTPUT"
           chmod +x "$OUTPUT"
           sha256sum "$OUTPUT" > "${OUTPUT}.sha256"
           ./"$OUTPUT" --version

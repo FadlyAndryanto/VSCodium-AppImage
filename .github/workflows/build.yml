@@ -1,79 +1,160 @@
-name: Build VSCodium DwarFS AppImage
+name: Build VSCodium AppImage (DwarFS + Profile)
 
 on:
+  schedule:
+    - cron: '0 */6 * * *'
   workflow_dispatch:
-    inputs:
-      version:
-        description: 'VSCodium release version (e.g., 1.143.17232)'
-        required: true
-        type: string
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
 
 env:
-  ARCH: x86_64
+  DWARFS_COMP: "zstd:level=22 -S26 -B2"
+  OPTIMIZE_LAUNCH: "1"
+  OPTIMIZE_LAUNCH_TIMEOUT: "15"
 
 jobs:
-  build-appimage:
+  build:
     runs-on: ubuntu-latest
-    env:
-      VERSION: ${{ inputs.version }}
-
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get latest VSCodium release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          LATEST=$(gh api repos/VSCodium/vscodium/releases/latest --jq '.tag_name')
+          echo "version=$LATEST" >> $GITHUB_OUTPUT
+          echo "Latest upstream version: $LATEST"
+          if gh release view "$LATEST" --repo ${{ github.repository }} > /dev/null 2>&1; then
+            echo "already_released=true" >> $GITHUB_OUTPUT
+            echo "Version $LATEST already exists in this repo → skipping"
+          else
+            echo "already_released=false" >> $GITHUB_OUTPUT
+            echo "New version detected → will build"
+          fi
+
+      - name: Skip if already released
+        if: steps.upstream.outputs.already_released == 'true'
+        run: echo "Nothing to do"
+
       - name: Install dependencies
+        if: steps.upstream.outputs.already_released == 'false'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            binutils curl desktop-file-utils libfuse2t64 libgbm1 libnss3 xz-utils xvfb
+          sudo apt-get install -y \
+            binutils \
+            desktop-file-utils \
+            libfuse2 \
+            xvfb \
+            x11-utils \
+            psmisc \
+            wget \
+            curl \
+            jq \
+            file
 
-      - name: Download VSCodium .deb and pkgforge-dev/appimagetool 0.7.0
+      - name: Download latest appimagetool (pkgforge-dev)
+        if: steps.upstream.outputs.already_released == 'false'
         run: |
-          mkdir -p build && cd build
-          curl -fSL "https://github.com/VSCodium/vscodium/releases/download/${VERSION}/codium_${VERSION}_amd64.deb" -o codium.deb
-          curl -fSL "https://github.com/pkgforge-dev/appimagetool/releases/download/0.7.0/appimagetool-full-x86_64-linux" -o appimagetool
+          URL=$(gh api repos/pkgforge-dev/appimagetool/releases/latest \
+            --jq '.assets[] | select(.name | test("x86_64.*linux$")) | .browser_download_url' | head -n1)
+          wget -q "$URL" -O appimagetool
           chmod +x appimagetool
+          ./appimagetool --version || true
 
-      - name: Assemble AppDir
+      - name: Download & extract VSCodium .deb
+        if: steps.upstream.outputs.already_released == 'false'
         run: |
-          cd build
-          mkdir -p VSCodium.AppDir
-          ar x codium.deb
-          tar -xJf data.tar.xz -C VSCodium.AppDir
-          cp VSCodium.AppDir/usr/share/applications/com.visualstudio.CodeOSS.desktop VSCodium.AppDir/
-          sed -i 's|^Exec=.*|Exec=codium %F|; s|^Icon=.*|Icon=vscodium|' VSCodium.AppDir/com.visualstudio.CodeOSS.desktop
-          cp VSCodium.AppDir/usr/share/pixmaps/vscodium.png VSCodium.AppDir/vscodium.png
-          ln -sf vscodium.png VSCodium.AppDir/.DirIcon
-          mkdir -p VSCodium.AppDir/usr/share/metainfo
-          cp VSCodium.AppDir/usr/share/appdata/com.visualstudio.CodeOSS.appdata.xml \
-            VSCodium.AppDir/usr/share/metainfo/com.visualstudio.CodeOSS.appdata.xml
-          cat << 'EOF' > VSCodium.AppDir/AppRun
-          #!/bin/sh
-          HERE="$(dirname "$(readlink -f "$0")")"
-          export PATH="$HERE/usr/share/codium/bin:$PATH"
-          exec "$HERE/usr/share/codium/bin/codium" "$@"
-          EOF
-          chmod +x VSCodium.AppDir/AppRun
+          VERSION="${{ steps.upstream.outputs.version }}"
+          DEB_URL="https://github.com/VSCodium/vscodium/releases/download/${VERSION}/codium_${VERSION}_amd64.deb"
+          echo "Downloading $DEB_URL"
+          wget -q "$DEB_URL" -O codium.deb
+          mkdir -p extract
+          dpkg-deb -x codium.deb extract
+          ls extract/usr/share/codium/bin/codium
+          ls extract/usr/share/applications/*.desktop
 
-      - name: Build DwarFS AppImage with profile optimization
+      - name: Prepare AppDir
+        if: steps.upstream.outputs.already_released == 'false'
         run: |
-          cd build
-          xvfb-run -a ./appimagetool \
-            --optimize-launch \
-            --profile-timeout 15 \
-            --dwarfs-comp "-l 6 -B 26 -S 26 --categorize" \
-            -o . \
-            VSCodium.AppDir
-          BUILT_APPIMAGE=$(ls -1 *.AppImage | grep -v '^appimagetool' | head -n 1)
-          OUTPUT="VSCodium-${VERSION}-x86_64.AppImage"
-          if [ "$BUILT_APPIMAGE" != "$OUTPUT" ]; then
-            mv "$BUILT_APPIMAGE" "$OUTPUT"
+          VERSION="${{ steps.upstream.outputs.version }}"
+          mkdir -p AppDir
+          cp -a extract/usr/share/codium AppDir/
+          cp extract/usr/share/applications/codium.desktop AppDir/
+          sed -i 's|^Exec=.*|Exec=codium %F|' AppDir/codium.desktop
+          sed -i 's|^Icon=.*|Icon=codium|' AppDir/codium.desktop
+          if [ -f extract/usr/share/pixmaps/vscodium.png ]; then
+            cp extract/usr/share/pixmaps/vscodium.png AppDir/codium.png
+          elif [ -f extract/usr/share/icons/hicolor/256x256/apps/vscodium.png ]; then
+            cp extract/usr/share/icons/hicolor/256x256/apps/vscodium.png AppDir/codium.png
+          else
+            find extract -name "*.png" | head -n1 | xargs -I{} cp {} AppDir/codium.png
           fi
-          chmod +x "$OUTPUT"
-          sha256sum "$OUTPUT" > "${OUTPUT}.sha256"
-          ./"$OUTPUT" --version
+          ln -sf codium.png AppDir/.DirIcon
+          cat > AppDir/AppRun << 'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "${0}")")"
+          if [ -x "${HERE}/codium/bin/codium" ]; then
+              exec "${HERE}/codium/bin/codium" "$@"
+          else
+              echo "Error: codium/bin/codium not found" >&2
+              exit 1
+          fi
+          EOF
+          chmod +x AppDir/AppRun
+          mkdir -p AppDir/usr/bin
+          ln -sf ../../codium/bin/codium AppDir/usr/bin/codium
+          echo "AppDir prepared successfully"
+          ls -la AppDir/
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Build AppImage (DwarFS + profiling)
+        if: steps.upstream.outputs.already_released == 'false'
+        run: |
+          VERSION="${{ steps.upstream.outputs.version }}"
+          export ARCH=x86_64
+          export APPIMAGE_ARCH=x86_64
+          export UPINFO="gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|*-x86_64.AppImage.zsync"
+          ./appimagetool \
+            --optimize-launch \
+            --profile-timeout ${{ env.OPTIMIZE_LAUNCH_TIMEOUT }} \
+            --dwarfs-comp "${{ env.DWARFS_COMP }}" \
+            --update-info "$UPINFO" \
+            --arch x86_64 \
+            --name "VSCodium-${VERSION}-anylinux-x86_64.AppImage" \
+            --output ./dist \
+            ./AppDir
+          ls -lh dist/
+          cd dist
+          APPIMAGE=$(ls *.AppImage | head -n1)
+          mv "$APPIMAGE" "VSCodium-${VERSION}-anylinux-x86_64.AppImage"
+          ls -lh
+
+      - name: Create GitHub Release
+        if: steps.upstream.outputs.already_released == 'false'
+        uses: softprops/action-gh-release@v2
         with:
-          name: VSCodium-AppImage-${{ inputs.version }}
-          path: |
-            build/VSCodium-*-x86_64.AppImage
-            build/VSCodium-*-x86_64.AppImage.sha256
+          tag_name: ${{ steps.upstream.outputs.version }}
+          name: VSCodium ${{ steps.upstream.outputs.version }} (DwarFS + Profile)
+          body: |
+            Automatic build of VSCodium AppImage using **pkgforge-dev/appimagetool**.
+
+            - **Filesystem**: DwarFS
+            - **Compression**: `${{ env.DWARFS_COMP }}` (maximum)
+            - **Launch optimization**: Profile-guided (`--optimize-launch`)
+            - Launches via the official `codium/bin/codium` wrapper (correct CLI + proper terminal detachment)
+
+            Upstream: https://github.com/VSCodium/vscodium/releases/tag/${{ steps.upstream.outputs.version }}
+          files: |
+            dist/*.AppImage
+            dist/*.zsync
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

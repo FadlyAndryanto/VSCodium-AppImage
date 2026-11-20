@@ -22,7 +22,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            binutils curl desktop-file-utils libfuse2t64 libgbm1 libnss3 python3 xz-utils xvfb
+            binutils curl desktop-file-utils libfuse2t64 libgbm1 libnss3 xz-utils xvfb
 
       - name: Download VSCodium .deb and pkgforge-dev/appimagetool 0.7.0
         run: |
@@ -52,40 +52,19 @@ jobs:
           EOF
           chmod +x VSCodium.AppDir/AppRun
 
-      - name: Build initial AppImage and profile startup access order
+      - name: Build DwarFS AppImage with profile optimization
         run: |
           cd build
-          ./appimagetool VSCodium.AppDir VSCodium-initial.AppImage
-          mkdir -p profile-userdata
-          xvfb-run -a bash -c '
-            export DWARFS_ANALYSIS_FILE="$PWD/vscodium.profile"
-            ./VSCodium-initial.AppImage --no-sandbox --user-data-dir="$PWD/profile-userdata" &
-            sleep 15
-            pkill -f "[.]mount_VSCodi" || true
-            sleep 3
-          '
-          fusermount -u /tmp/.mount_VSCodi* 2>/dev/null || true
-          test -s vscodium.profile
-
-      - name: Repack DwarFS with profile ordering
-        run: |
-          cd build
+          xvfb-run -a ./appimagetool \
+            --optimize-launch \
+            --profile-timeout 15 \
+            --dwarfs-comp "-l 6 -B 26 -S 26 --categorize" \
+            -o . \
+            VSCodium.AppDir
+          BUILT_APPIMAGE=$(ls -1 *.AppImage | grep -v '^appimagetool' | head -n 1)
           OUTPUT="VSCodium-${VERSION}-x86_64.AppImage"
-          python3 - << 'EOF'
-          with open("VSCodium-initial.AppImage", "rb") as f:
-              data = f.read()
-          offset = data.find(b"DWARFS\x02", 4096)
-          assert offset > 0, "DWARFS superblock not found"
-          with open("uruntime.bin", "wb") as out:
-              out.write(data[:offset])
-          EOF
-          if command -v mkdwarfs >/dev/null 2>&1; then
-            mkdwarfs -i VSCodium.AppDir -o vscodium.dwarfs -l 6 -B 26 -S 26 \
-              --categorize --order=explicit --explicit-order="$PWD/vscodium.profile" \
-              --set-owner=0 --set-group=0 --no-progress
-            cat uruntime.bin vscodium.dwarfs > "$OUTPUT"
-          else
-            ./appimagetool VSCodium.AppDir "$OUTPUT"
+          if [ "$BUILT_APPIMAGE" != "$OUTPUT" ]; then
+            mv "$BUILT_APPIMAGE" "$OUTPUT"
           fi
           chmod +x "$OUTPUT"
           sha256sum "$OUTPUT" > "${OUTPUT}.sha256"

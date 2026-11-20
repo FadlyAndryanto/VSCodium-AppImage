@@ -55,7 +55,7 @@ jobs:
       - name: Build initial AppImage and profile startup access order
         run: |
           cd build
-          ./appimagetool --no-appstream VSCodium.AppDir VSCodium-initial.AppImage
+          ./appimagetool VSCodium.AppDir VSCodium-initial.AppImage
           mkdir -p profile-userdata
           xvfb-run -a bash -c '
             export DWARFS_ANALYSIS_FILE="$PWD/vscodium.profile"
@@ -85,7 +85,7 @@ jobs:
               --set-owner=0 --set-group=0 --no-progress
             cat uruntime.bin vscodium.dwarfs > "$OUTPUT"
           else
-            ./appimagetool --no-appstream VSCodium.AppDir "$OUTPUT"
+            ./appimagetool VSCodium.AppDir "$OUTPUT"
           fi
           chmod +x "$OUTPUT"
           sha256sum "$OUTPUT" > "${OUTPUT}.sha256"

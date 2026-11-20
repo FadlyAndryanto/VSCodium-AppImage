@@ -1,0 +1,127 @@
+name: Build VSCodium DwarFS AppImage
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'VSCodium release version (e.g., 1.143.17232)'
+        required: true
+        type: string
+
+env:
+  ARCH: x86_64
+
+jobs:
+  build-appimage:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            binutils \
+            curl \
+            desktop-file-utils \
+            libfuse2t64 \
+            python3 \
+            xz-utils \
+            xvfb
+
+      - name: Download VSCodium .deb and pkgforge-dev/appimagetool
+        run: |
+          mkdir -p build && cd build
+          curl -fSL "https://github.com/VSCodium/vscodium/releases/download/${VERSION}/codium_${VERSION}_amd64.deb" -o codium.deb
+          curl -fSL "https://github.com/pkgforge-dev/appimagetool/releases/latest/download/appimagetool-x86_64.AppImage" -o appimagetool.AppImage
+          chmod +x appimagetool.AppImage
+          ./appimagetool.AppImage --appimage-extract
+
+      - name: Assemble AppDir
+        run: |
+          cd build
+          mkdir -p VSCodium.AppDir
+          ar x codium.deb
+          tar -xJf data.tar.xz -C VSCodium.AppDir
+          cp VSCodium.AppDir/usr/share/applications/com.visualstudio.CodeOSS.desktop VSCodium.AppDir/
+          sed -i 's|^Exec=.*|Exec=codium %F|g' VSCodium.AppDir/com.visualstudio.CodeOSS.desktop
+          sed -i 's|^Icon=.*|Icon=vscodium|g' VSCodium.AppDir/com.visualstudio.CodeOSS.desktop
+          cp VSCodium.AppDir/usr/share/pixmaps/vscodium.png VSCodium.AppDir/vscodium.png
+          ln -sf vscodium.png VSCodium.AppDir/.DirIcon
+          mkdir -p VSCodium.AppDir/usr/share/metainfo
+          cp VSCodium.AppDir/usr/share/appdata/com.visualstudio.CodeOSS.appdata.xml \
+            VSCodium.AppDir/usr/share/metainfo/com.visualstudio.CodeOSS.appdata.xml
+          cat << 'EOF' > VSCodium.AppDir/AppRun
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          export PATH="$HERE/usr/share/codium/bin:$PATH"
+          exec "$HERE/usr/share/codium/bin/codium" "$@"
+          EOF
+          chmod +x VSCodium.AppDir/AppRun
+
+      - name: Build initial DwarFS AppImage for profiling
+        run: |
+          cd build
+          ./squashfs-root/AppRun --comp dwarfs --no-appstream VSCodium.AppDir VSCodium-initial.AppImage
+
+      - name: Profile startup file access order
+        run: |
+          cd build
+          mkdir -p profile-userdata
+          xvfb-run -a -s "-screen 0 1920x1080x24" bash -c '
+            export DWARFS_ANALYSIS_FILE="$PWD/vscodium.profile"
+            ./VSCodium-initial.AppImage --no-sandbox --user-data-dir="$PWD/profile-userdata" &
+            sleep 15
+            pkill -f "codium" || true
+            sleep 3
+          '
+          fusermount -u /tmp/.mount_VSCodi* 2>/dev/null || true
+          if [ ! -s vscodium.profile ]; then
+            echo "Error: DwarFS analysis profile was not generated."
+            exit 1
+          fi
+          echo "Profiled $(wc -l < vscodium.profile) accessed files."
+
+      - name: Repack DwarFS with profile ordering and maximum compression
+        run: |
+          cd build
+          OUTPUT="VSCodium-${VERSION}-x86_64.AppImage"
+          MKDWARFS=$(find squashfs-root -type f -name 'mkdwarfs' | head -n 1)
+          "$MKDWARFS" \
+            -i VSCodium.AppDir \
+            -o vscodium.dwarfs \
+            -l 9 \
+            -B 26 \
+            -S 26 \
+            --categorize \
+            --order=explicit \
+            --explicit-order="$PWD/vscodium.profile" \
+            --set-owner=0 \
+            --set-group=0 \
+            --no-progress
+          URUNTIME=$(find squashfs-root -type f -name 'uruntime*' | head -n 1)
+          if [ -z "$URUNTIME" ]; then
+            ELF_SIZE=$(python3 -c '
+          import struct
+          with open("VSCodium-initial.AppImage", "rb") as f:
+              hdr = f.read(64)
+              e_shoff = struct.unpack_from("<Q", hdr, 40)[0]
+              e_shentsize, e_shnum = struct.unpack_from("<HH", hdr, 58)
+              print(e_shoff + e_shentsize * e_shnum)
+          ')
+            head -c "$ELF_SIZE" VSCodium-initial.AppImage > uruntime.bin
+            URUNTIME="uruntime.bin"
+          fi
+          cat "$URUNTIME" vscodium.dwarfs > "$OUTPUT"
+          chmod +x "$OUTPUT"
+          sha256sum "$OUTPUT" > "${OUTPUT}.sha256"
+          ./"$OUTPUT" --version
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VSCodium-AppImage-${{ inputs.version }}
+          path: |
+            build/VSCodium-*-x86_64.AppImage
+            build/VSCodium-*-x86_64.AppImage.sha256

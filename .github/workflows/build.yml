@@ -34,7 +34,7 @@ jobs:
           echo "Latest upstream version: $LATEST"
           if gh release view "$LATEST" --repo ${{ github.repository }} > /dev/null 2>&1; then
             echo "already_released=true" >> $GITHUB_OUTPUT
-            echo "Version $LATEST already exists in this repo → skipping"
+            echo "Version $LATEST already exists → skipping"
           else
             echo "already_released=false" >> $GITHUB_OUTPUT
             echo "New version detected → will build"
@@ -62,9 +62,16 @@ jobs:
 
       - name: Download latest appimagetool (pkgforge-dev)
         if: steps.upstream.outputs.already_released == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           URL=$(gh api repos/pkgforge-dev/appimagetool/releases/latest \
-            --jq '.assets[] | select(.name | test("x86_64.*linux$")) | .browser_download_url' | head -n1)
+            --jq '.assets[] | select(.name | test("appimagetool-x86_64-linux$")) | .browser_download_url' | head -n1)
+          if [ -z "$URL" ]; then
+            URL=$(gh api repos/pkgforge-dev/appimagetool/releases/latest \
+              --jq '.assets[] | select(.name | test("x86_64.*linux")) | .browser_download_url' | head -n1)
+          fi
+          echo "Downloading: $URL"
           wget -q "$URL" -O appimagetool
           chmod +x appimagetool
           ./appimagetool --version || true
@@ -95,7 +102,7 @@ jobs:
           elif [ -f extract/usr/share/icons/hicolor/256x256/apps/vscodium.png ]; then
             cp extract/usr/share/icons/hicolor/256x256/apps/vscodium.png AppDir/codium.png
           else
-            find extract -name "*.png" | head -n1 | xargs -I{} cp {} AppDir/codium.png
+            find extract -name "*vscodium*.png" -o -name "*codium*.png" | head -n1 | xargs -I{} cp {} AppDir/codium.png
           fi
           ln -sf codium.png AppDir/.DirIcon
           cat > AppDir/AppRun << 'EOF'
@@ -111,7 +118,7 @@ jobs:
           chmod +x AppDir/AppRun
           mkdir -p AppDir/usr/bin
           ln -sf ../../codium/bin/codium AppDir/usr/bin/codium
-          echo "AppDir prepared successfully"
+          echo "AppDir prepared"
           ls -la AppDir/
 
       - name: Build AppImage (DwarFS + profiling)
@@ -121,6 +128,7 @@ jobs:
           export ARCH=x86_64
           export APPIMAGE_ARCH=x86_64
           export UPINFO="gh-releases-zsync|${{ github.repository_owner }}|${{ github.event.repository.name }}|latest|*-x86_64.AppImage.zsync"
+          mkdir -p dist
           ./appimagetool \
             --optimize-launch \
             --profile-timeout ${{ env.OPTIMIZE_LAUNCH_TIMEOUT }} \
@@ -130,10 +138,9 @@ jobs:
             --name "VSCodium-${VERSION}-anylinux-x86_64.AppImage" \
             --output ./dist \
             ./AppDir
-          ls -lh dist/
           cd dist
           APPIMAGE=$(ls *.AppImage | head -n1)
-          mv "$APPIMAGE" "VSCodium-${VERSION}-anylinux-x86_64.AppImage"
+          mv -f "$APPIMAGE" "VSCodium-${VERSION}-anylinux-x86_64.AppImage" || true
           ls -lh
 
       - name: Create GitHub Release
@@ -145,10 +152,10 @@ jobs:
           body: |
             Automatic build of VSCodium AppImage using **pkgforge-dev/appimagetool**.
 
-            - **Filesystem**: DwarFS
-            - **Compression**: `${{ env.DWARFS_COMP }}` (maximum)
-            - **Launch optimization**: Profile-guided (`--optimize-launch`)
-            - Launches via the official `codium/bin/codium` wrapper (correct CLI + proper terminal detachment)
+            - Filesystem: **DwarFS**
+            - Compression: `${{ env.DWARFS_COMP }}`
+            - Launch optimization: Profile-guided (`--optimize-launch`)
+            - Launches via the official `codium/bin/codium` wrapper
 
             Upstream: https://github.com/VSCodium/vscodium/releases/tag/${{ steps.upstream.outputs.version }}
           files: |

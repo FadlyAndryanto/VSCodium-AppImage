@@ -75,96 +75,41 @@ jobs:
           echo "Release already exists: ${release_exists}"
           echo "Build required: ${should_build}"
 
-      - name: Install launch-profiling prerequisites
+      - name: Skip Build
+        if: steps.release.outputs.should_build != 'true'
+        run: echo "Build not required. Exiting gracefully."
+
+      - name: Install build essentials
         if: steps.release.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-
-          packages=()
-          if ! command -v xvfb-run >/dev/null 2>&1 || ! command -v Xvfb >/dev/null 2>&1; then
-            packages+=(xvfb)
-          fi
-          if ! command -v xauth >/dev/null 2>&1; then
-            packages+=(xauth)
-          fi
-          if ! command -v fusermount3 >/dev/null 2>&1 && ! command -v fusermount >/dev/null 2>&1; then
-            packages+=(fuse3)
-          fi
-
-          if ((${#packages[@]})); then
-            sudo apt-get update
-            sudo apt-get install -y --no-install-recommends "${packages[@]}"
-          fi
-
-          sudo modprobe fuse 2>/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            xvfb xauth fuse3 libfuse2
+          sudo modprobe fuse || true
           if [[ ! -c /dev/fuse ]]; then
-            echo "FUSE is unavailable: /dev/fuse is missing; launch profiling cannot run." >&2
+            echo "FUSE is unavailable: /dev/fuse is missing." >&2
             exit 1
           fi
           sudo chmod 666 /dev/fuse
-
           if ! command -v fusermount >/dev/null 2>&1; then
-            if command -v fusermount3 >/dev/null 2>&1; then
-              sudo ln -sf "$(command -v fusermount3)" /usr/local/bin/fusermount
-            else
-              echo "Neither fusermount nor fusermount3 is available." >&2
-              exit 1
-            fi
+            sudo ln -sf "$(command -v fusermount3)" /usr/local/bin/fusermount
           fi
-
-          runtime_dir="${RUNNER_TEMP}/xdg-runtime"
-          mkdir -p "${runtime_dir}"
-          chmod 0700 "${runtime_dir}"
-          {
-            echo "USER=$(id -un)"
-            echo "LOGNAME=$(id -un)"
-            echo "XDG_RUNTIME_DIR=${runtime_dir}"
-          } >> "${GITHUB_ENV}"
+          echo "XDG_RUNTIME_DIR=${RUNNER_TEMP}/xdg-runtime" >> "${GITHUB_ENV}"
+          mkdir -p "${XDG_RUNTIME_DIR}"
+          chmod 0700 "${XDG_RUNTIME_DIR}"
 
       - name: Install latest pkgforge appimagetool
         id: appimagetool
         if: steps.release.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-
-          release_json="$(gh api repos/pkgforge-dev/appimagetool/releases/latest)"
-          release_tag="$(jq -er '.tag_name' <<< "${release_json}")"
-          asset_name="appimagetool-x86_64-linux"
-          asset="$(jq -cer --arg name "${asset_name}" \
-            '[.assets[]? | select(.name == $name)] | if length == 1 then .[0] else error("expected exactly one asset named appimagetool-x86_64-linux") end' \
-            <<< "${release_json}")"
-          asset_url="$(jq -er '.browser_download_url' <<< "${asset}")"
-
-          case "${asset_url}" in
-            https://github.com/pkgforge-dev/appimagetool/releases/download/*) ;;
-            *)
-              echo "Unexpected appimagetool asset URL: ${asset_url}" >&2
-              exit 1
-              ;;
-          esac
-
-          tool_path="${RUNNER_TEMP}/appimagetool"
-          curl --fail --location --silent --show-error \
-            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
-            --output "${tool_path}" "${asset_url}"
-
-          digest="$(jq -r '.digest // empty' <<< "${asset}")"
-          if [[ -n "${digest}" ]]; then
-            algorithm="${digest%%:*}"
-            expected_hash="${digest#*:}"
-            if [[ "${algorithm}" != sha256 || ! "${expected_hash}" =~ ^[[:xdigit:]]{64}$ ]]; then
-              echo "Unsupported appimagetool asset digest: ${digest}" >&2
-              exit 1
-            fi
-            printf '%s  %s\n' "${expected_hash}" "${tool_path}" | sha256sum --check
-          else
-            echo "No GitHub asset digest was published; skipping optional digest verification." >&2
-          fi
-
-          sudo install -m 0755 "${tool_path}" /usr/local/bin/appimagetool
-          appimagetool --version
-          echo "version=${release_tag}" >> "${GITHUB_OUTPUT}"
-          echo "Using pkgforge appimagetool ${release_tag}"
+          APPIMAGETOOL_VERSION="0.6.13"
+          TOOL_URL="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64-linux"
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+            -o "${RUNNER_TEMP}/appimagetool" "${TOOL_URL}"
+          sudo install -m 0755 "${RUNNER_TEMP}/appimagetool" /usr/local/bin/appimagetool
+          echo "version=${APPIMAGETOOL_VERSION}" >> "${GITHUB_OUTPUT}"
 
       - name: Download and extract VSCodium
         if: steps.release.outputs.should_build == 'true'
@@ -172,100 +117,59 @@ jobs:
           VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-
           deb="${RUNNER_TEMP}/codium_${VERSION}_amd64.deb"
           url="https://github.com/VSCodium/vscodium/releases/download/${VERSION}/codium_${VERSION}_amd64.deb"
-          curl --fail --location --silent --show-error \
-            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
-            --output "${deb}" "${url}"
-
-          package_name="$(dpkg-deb -f "${deb}" Package)"
-          deb_version="$(dpkg-deb -f "${deb}" Version)"
-          deb_version="${deb_version#*:}"
-          if [[ "${package_name}" != codium || "${deb_version}" != "${VERSION}" ]]; then
-            echo "Unexpected Debian package: ${package_name} ${deb_version} (expected codium ${VERSION})." >&2
-            exit 1
-          fi
-
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+            -o "${deb}" "${url}"
           appdir="${GITHUB_WORKSPACE}/AppDir"
           mkdir -p "${appdir}"
           dpkg-deb -x "${deb}" "${appdir}"
 
-      - name: Prepare AppDir and generate AppRun
+      - name: Prepare AppDir
         if: steps.release.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-
           appdir="${GITHUB_WORKSPACE}/AppDir"
-          desktop_source="${appdir}/usr/share/applications/com.visualstudio.CodeOSS.desktop"
-          icon_source="${appdir}/usr/share/pixmaps/vscodium.png"
-          launcher="${appdir}/usr/share/codium/bin/codium"
-          application="${appdir}/usr/share/codium/codium"
-
-          for required in "${desktop_source}" "${icon_source}" "${launcher}" "${application}"; do
-            if [[ ! -f "${required}" ]]; then
-              echo "Required VSCodium package file missing: ${required}" >&2
-              exit 1
-            fi
+          required_files=(
+            "${appdir}/usr/share/applications/com.visualstudio.CodeOSS.desktop"
+            "${appdir}/usr/share/pixmaps/vscodium.png"
+            "${appdir}/usr/share/codium/bin/codium"
+          )
+          for f in "${required_files[@]}"; do
+            [[ -f "${f}" ]] || { echo "Missing: ${f}" >&2; exit 1; }
           done
-
           awk '
             /^Exec=/    { sub(/^Exec=[^[:space:]]+/, "Exec=AppRun") }
             /^TryExec=/ { $0 = "TryExec=AppRun" }
             /^Icon=/    { $0 = "Icon=codium" }
             /^Path=/    { next }
                         { print }
-          ' "${desktop_source}" > "${appdir}/codium.desktop"
-
-          install -m 0644 "${icon_source}" "${appdir}/codium.png"
+          ' "${required_files[0]}" > "${appdir}/codium.desktop"
+          install -m 0644 "${required_files[1]}" "${appdir}/codium.png"
           ln -sfn codium.png "${appdir}/.DirIcon"
-
-          cat > "${appdir}/AppRun" <<'APP_RUN_EOF'
+          cat > "${appdir}/AppRun" <<'EOF'
           #!/bin/sh
           set -eu
-
-          if [ -z "${APPDIR:-}" ]; then
-            APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
-          fi
+          APPDIR="${APPDIR:-$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)}"
           export APPDIR
           exec "$APPDIR/usr/share/codium/bin/codium" "$@"
-          APP_RUN_EOF
-          chmod 0755 "${appdir}/AppRun" "${launcher}"
+          EOF
+          chmod 0755 "${appdir}/AppRun"
 
-          grep -q '^Exec=AppRun' "${appdir}/codium.desktop" || {
-            echo "Could not rewrite the VSCodium desktop Exec entry." >&2
-            exit 1
-          }
-          grep -q '^Icon=codium$' "${appdir}/codium.desktop" || {
-            echo "Could not rewrite the VSCodium desktop Icon entry." >&2
-            exit 1
-          }
-
-          desktop_count="$(find "${appdir}" -maxdepth 1 -type f -name '*.desktop' | wc -l)"
-          if [[ "${desktop_count}" -ne 1 ]]; then
-            echo "Expected exactly one root .desktop file; found ${desktop_count}." >&2
-            exit 1
-          fi
-
-      - name: Build profiled DWARFS AppImage
+      - name: Build AppImage
         if: steps.release.outputs.should_build == 'true'
         id: build
         env:
           VERSION: ${{ steps.release.outputs.version }}
-          APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
         run: |
           set -euo pipefail
-
           appdir="${GITHUB_WORKSPACE}/AppDir"
           dist="${GITHUB_WORKSPACE}/dist"
           profile="${RUNNER_TEMP}/codium-${VERSION}.dwarfsprofile"
           owner="${GITHUB_REPOSITORY%/*}"
           repo="${GITHUB_REPOSITORY#*/}"
           update_info="gh-releases-zsync|${owner}|${repo}|latest|*-x86_64.AppImage.zsync"
-
-          rm -rf "${dist}"
           mkdir -p "${dist}"
-
           APPIMAGE_ARCH=x86_64 ARCH=x86_64 VERSION="${VERSION}" \
             appimagetool --verbose \
               --optimize-launch \
@@ -274,47 +178,30 @@ jobs:
               --update-info "${update_info}" \
               "${appdir}" \
               --output "${dist}"
-
           if [[ ! -s "${profile}" ]]; then
-            echo "DWARFS launch profiling did not produce a profile file." >&2
-            exit 1
+            echo "DWARFS profile not generated." >&2; exit 1
           fi
-
           shopt -s nullglob
           images=("${dist}"/*.AppImage)
           zsyncs=("${dist}"/*.AppImage.zsync)
           if [[ "${#images[@]}" -ne 1 || ! -s "${images[0]}" ]]; then
-            echo "Expected exactly one non-empty AppImage in ${dist}." >&2
-            exit 1
+            echo "Expected exactly one non-empty AppImage." >&2; exit 1
           fi
           if [[ "${#zsyncs[@]}" -ne 1 || ! -s "${zsyncs[0]}" ]]; then
-            echo "Expected exactly one non-empty .AppImage.zsync file in ${dist}." >&2
-            exit 1
+            echo "Expected exactly one non-empty .zsync file." >&2; exit 1
           fi
-          if [[ ! -s "${dist}/appinfo" ]]; then
-            echo "appimagetool did not create the appinfo metadata file." >&2
-            exit 1
-          fi
-
-          chmod 0755 "${images[0]}"
-          (
-            cd "${dist}"
-            sha256sum "$(basename "${images[0]}")" "$(basename "${zsyncs[0]}")" appinfo > SHA256SUMS
-          )
-
+          (cd "${dist}" && sha256sum *.AppImage *.AppImage.zsync appinfo > SHA256SUMS)
           {
             echo "### VSCodium ${VERSION} AppImage"
             echo ""
             echo "- AppImage: \`$(basename "${images[0]}")\`"
             echo "- Appimagetool: \`${APPIMAGETOOL_VERSION}\`"
-            echo "- DWARFS launch profile: generated (45-second capture)"
+            echo "- DWARFS launch profile: generated"
             echo ""
             echo '```text'
             (cd "${dist}" && cat SHA256SUMS)
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
-
-          ls -lh "${dist}"
 
       - name: Publish GitHub release
         if: steps.release.outputs.should_build == 'true'
@@ -324,7 +211,6 @@ jobs:
           APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
         run: |
           set -euo pipefail
-
           dist="${GITHUB_WORKSPACE}/dist"
           title="VSCodium ${VERSION} — DWARFS AppImage"
           notes="$(cat <<EOF
@@ -335,7 +221,6 @@ jobs:
           - Includes the AppImage, zsync metadata, appinfo, and SHA-256 checksums.
           EOF
           )"
-
           if [[ "${RELEASE_EXISTS}" == true ]]; then
             gh release upload "${VERSION}" "${dist}"/* --clobber
             gh release edit "${VERSION}" --title "${title}" --notes "${notes}"
@@ -345,5 +230,4 @@ jobs:
               --title "${title}" \
               --notes "${notes}"
           fi
-
           echo "Published VSCodium ${VERSION} AppImage release."

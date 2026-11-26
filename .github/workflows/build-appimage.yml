@@ -104,12 +104,15 @@ jobs:
         if: steps.release.outputs.should_build == 'true'
         run: |
           set -euo pipefail
-          APPIMAGETOOL_VERSION="0.6.13"
-          TOOL_URL="https://github.com/pkgforge-dev/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64-linux"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
-            -o "${RUNNER_TEMP}/appimagetool" "${TOOL_URL}"
+          tag="$(gh api repos/pkgforge-dev/appimagetool/releases/latest --jq '.tag_name')"
+          url="https://github.com/pkgforge-dev/appimagetool/releases/download/${tag}/appimagetool-x86_64-linux"
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+            --output "${RUNNER_TEMP}/appimagetool" "${url}"
           sudo install -m 0755 "${RUNNER_TEMP}/appimagetool" /usr/local/bin/appimagetool
-          echo "version=${APPIMAGETOOL_VERSION}" >> "${GITHUB_OUTPUT}"
+          appimagetool --version
+          echo "version=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Using pkgforge appimagetool ${tag}"
 
       - name: Download and extract VSCodium
         if: steps.release.outputs.should_build == 'true'
@@ -119,8 +122,9 @@ jobs:
           set -euo pipefail
           deb="${RUNNER_TEMP}/codium_${VERSION}_amd64.deb"
           url="https://github.com/VSCodium/vscodium/releases/download/${VERSION}/codium_${VERSION}_amd64.deb"
-          curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
-            -o "${deb}" "${url}"
+          curl --fail --location --silent --show-error \
+            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+            --output "${deb}" "${url}"
           appdir="${GITHUB_WORKSPACE}/AppDir"
           mkdir -p "${appdir}"
           dpkg-deb -x "${deb}" "${appdir}"
@@ -161,6 +165,7 @@ jobs:
         id: build
         env:
           VERSION: ${{ steps.release.outputs.version }}
+          APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
         run: |
           set -euo pipefail
           appdir="${GITHUB_WORKSPACE}/AppDir"

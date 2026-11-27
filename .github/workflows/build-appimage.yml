@@ -2,25 +2,25 @@ name: Build VSCodium AppImage
 
 on:
   schedule:
-    - cron: "23 */3 * * *"
+    - cron: "23 */3 * * *"          # every 3 hours
   workflow_dispatch:
     inputs:
       version:
-        description: "Optional VSCodium version/tag (for example 1.143.17232)"
+        description: "Optional VSCodium version/tag (e.g. 1.143.17232)"
         required: false
         type: string
       rebuild:
-        description: "Rebuild and replace assets even when this version already has a release"
+        description: "Rebuild and replace assets even if this version already has a release"
         required: false
         default: false
         type: boolean
 
 permissions:
-  contents: read
+  contents: read                     # least privilege at workflow level
 
 concurrency:
   group: vscodium-appimage-release
-  cancel-in-progress: false
+  cancel-in-progress: false          # never cancel a release build mid‑flight
 
 jobs:
   resolve:
@@ -50,6 +50,7 @@ jobs:
             version="${version#v}"
           fi
 
+          # Validate format: three numeric components
           if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "Invalid VSCodium version/tag: ${version}" >&2
             exit 1
@@ -82,7 +83,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
-      contents: write
+      contents: write                  # only the publish job can write releases
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
     defaults:
@@ -90,12 +91,17 @@ jobs:
         shell: bash
 
     steps:
-      - name: Install build dependencies and appimagetool
+      # ------------------------------------------------------------------
+      # 1. FUSE + appimagetool (cached)
+      # ------------------------------------------------------------------
+      - name: Install FUSE and cached appimagetool
         id: appimagetool
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
+          # FUSE prerequisites
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends fuse3 libfuse2
 
@@ -108,34 +114,56 @@ jobs:
           if ! command -v fusermount >/dev/null 2>&1; then
             sudo ln -sf "$(command -v fusermount3)" /usr/local/bin/fusermount
           fi
+
           runtime_dir="${RUNNER_TEMP}/xdg-runtime"
           mkdir -p "${runtime_dir}"
           chmod 0700 "${runtime_dir}"
           echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
 
+          # Discover the latest appimagetool tag (only needed on cache miss)
           tag="$(gh api repos/pkgforge-dev/appimagetool/releases/latest --jq '.tag_name')"
-          url="https://github.com/pkgforge-dev/appimagetool/releases/download/${tag}/appimagetool-x86_64-linux"
-          curl --fail --location --silent --show-error \
-            --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
-            --output "${RUNNER_TEMP}/appimagetool" "${url}"
-          sudo install -m 0755 "${RUNNER_TEMP}/appimagetool" /usr/local/bin/appimagetool
-          appimagetool --version
           echo "version=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "Using pkgforge appimagetool ${tag}"
 
-      - name: Download and prepare VSCodium AppDir
+          # Try to restore a cached copy first
+          cache_dir="${RUNNER_TEMP}/appimagetool-cache"
+          mkdir -p "${cache_dir}"
+          cache_file="${cache_dir}/appimagetool-${tag}"
+          if [[ -f "${cache_file}" ]]; then
+            echo "Using cached appimagetool ${tag}"
+            sudo install -m 0755 "${cache_file}" /usr/local/bin/appimagetool
+          else
+            echo "Downloading appimagetool ${tag}"
+            url="https://github.com/pkgforge-dev/appimagetool/releases/download/${tag}/appimagetool-x86_64-linux"
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
+              --output "${cache_file}" "${url}"
+            sudo install -m 0755 "${cache_file}" /usr/local/bin/appimagetool
+          fi
+
+          appimagetool --version
+
+      # ------------------------------------------------------------------
+      # 2. Download deb, prepare AppDir, build AppImage + checksums
+      # ------------------------------------------------------------------
+      - name: Download, prepare AppDir, and build AppImage
+        env:
+          APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
         run: |
           set -euo pipefail
+
+          # --- download deb -------------------------------------------------
           deb="${RUNNER_TEMP}/codium_${VERSION}_amd64.deb"
           url="https://github.com/VSCodium/vscodium/releases/download/${VERSION}/codium_${VERSION}_amd64.deb"
           curl --fail --location --silent --show-error \
             --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
             --output "${deb}" "${url}"
 
+          # --- extract -------------------------------------------------------
           appdir="${GITHUB_WORKSPACE}/AppDir"
           mkdir -p "${appdir}"
           dpkg-deb -x "${deb}" "${appdir}"
 
+          # --- validate required files --------------------------------------
           desktop="${appdir}/usr/share/applications/com.visualstudio.CodeOSS.desktop"
           icon="${appdir}/usr/share/pixmaps/vscodium.png"
           codium="${appdir}/usr/share/codium/bin/codium"
@@ -143,6 +171,7 @@ jobs:
             [[ -f "${file}" ]] || { echo "Missing required file: ${file}" >&2; exit 1; }
           done
 
+          # --- rewrite desktop entry ----------------------------------------
           awk '
             /^Exec=/    { sub(/^Exec=[^[:space:]]+/, "Exec=AppRun") }
             /^TryExec=/ { $0 = "TryExec=AppRun" }
@@ -150,8 +179,10 @@ jobs:
             /^Path=/    { next }
                         { print }
           ' "${desktop}" > "${appdir}/codium.desktop"
+
           install -m 0644 "${icon}" "${appdir}/codium.png"
           ln -sfn codium.png "${appdir}/.DirIcon"
+
           cat > "${appdir}/AppRun" <<'EOF'
           #!/bin/sh
           set -eu
@@ -161,12 +192,7 @@ jobs:
           EOF
           chmod 0755 "${appdir}/AppRun"
 
-      - name: Build AppImage and checksums
-        env:
-          APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
-        run: |
-          set -euo pipefail
-          appdir="${GITHUB_WORKSPACE}/AppDir"
+          # --- build AppImage ------------------------------------------------
           dist="${GITHUB_WORKSPACE}/dist"
           profile="${RUNNER_TEMP}/codium-${VERSION}.dwarfsprofile"
           owner="${GITHUB_REPOSITORY%/*}"
@@ -183,19 +209,26 @@ jobs:
               "${appdir}" \
               --output "${dist}"
 
+          # --- sanity checks -------------------------------------------------
           [[ -s "${profile}" ]] || { echo "DWARFS profile not generated." >&2; exit 1; }
           [[ -s "${dist}/appinfo" ]] || { echo "appinfo not generated." >&2; exit 1; }
+
           shopt -s nullglob
           images=("${dist}"/*.AppImage)
           zsyncs=("${dist}"/*.AppImage.zsync)
+
           if [[ "${#images[@]}" -ne 1 || ! -s "${images[0]}" ]]; then
-            echo "Expected exactly one non-empty AppImage." >&2; exit 1
+            echo "Expected exactly one non‑empty AppImage." >&2
+            exit 1
           fi
           if [[ "${#zsyncs[@]}" -ne 1 || ! -s "${zsyncs[0]}" ]]; then
-            echo "Expected exactly one non-empty .zsync file." >&2; exit 1
+            echo "Expected exactly one non‑empty .zsync file." >&2
+            exit 1
           fi
 
+          # --- checksums + summary -------------------------------------------
           (cd "${dist}" && sha256sum "${images[0]}" "${zsyncs[0]}" appinfo > SHA256SUMS)
+
           {
             echo "### VSCodium ${VERSION} AppImage"
             echo ""
@@ -208,6 +241,9 @@ jobs:
             echo '```'
           } >> "${GITHUB_STEP_SUMMARY}"
 
+      # ------------------------------------------------------------------
+      # 3. Publish release (idempotent)
+      # ------------------------------------------------------------------
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -216,18 +252,20 @@ jobs:
           APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
         run: |
           set -euo pipefail
+
           dist="${GITHUB_WORKSPACE}/dist"
           title="VSCodium ${VERSION} — DWARFS AppImage"
           notes="$(cat <<EOF
           Built from the upstream VSCodium ${VERSION} AMD64 Debian package.
 
-          - DWARFS compression with launch-profile optimization.
+          - DWARFS compression with launch‑profile optimization.
           - Built using pkgforge-dev/appimagetool ${APPIMAGETOOL_VERSION}.
-          - Includes the AppImage, zsync metadata, appinfo, and SHA-256 checksums.
+          - Includes the AppImage, zsync metadata, appinfo, and SHA‑256 checksums.
           EOF
           )"
 
           if [[ "${RELEASE_EXISTS}" == true ]]; then
+            # Overwrite existing assets safely
             gh release upload "${VERSION}" "${dist}"/* --clobber
             gh release edit "${VERSION}" --title "${title}" --notes "${notes}"
           else
@@ -236,4 +274,5 @@ jobs:
               --title "${title}" \
               --notes "${notes}"
           fi
+
           echo "Published VSCodium ${VERSION} AppImage release."

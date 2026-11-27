@@ -16,30 +16,30 @@ on:
         type: boolean
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: vscodium-appimage-release
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: Build x86_64 AppImage
+  resolve:
+    name: Check whether a build is needed
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-    defaults:
-      run:
-        shell: bash
-
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      release_exists: ${{ steps.release.outputs.release_exists }}
+      should_build: ${{ steps.release.outputs.should_build }}
     steps:
       - name: Resolve VSCodium release
         id: release
         env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           REQUESTED_VERSION: ${{ inputs.version }}
           REBUILD: ${{ inputs.rebuild }}
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -56,7 +56,7 @@ jobs:
           fi
 
           release_exists=false
-          if gh release view "${version}" --json tagName >/dev/null 2>&1; then
+          if gh release view "${version}" --repo "${GH_REPO}" --json tagName >/dev/null 2>&1; then
             release_exists=true
           fi
 
@@ -75,17 +75,30 @@ jobs:
           echo "Release already exists: ${release_exists}"
           echo "Build required: ${should_build}"
 
-      - name: Skip Build
-        if: steps.release.outputs.should_build != 'true'
-        run: echo "Build not required. Exiting gracefully."
+  build:
+    name: Build and publish x86_64 AppImage
+    needs: resolve
+    if: needs.resolve.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    defaults:
+      run:
+        shell: bash
 
-      - name: Install build essentials
-        if: steps.release.outputs.should_build == 'true'
+    steps:
+      - name: Install build dependencies and appimagetool
+        id: appimagetool
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            xvfb xauth fuse3 libfuse2
+          sudo apt-get install -y --no-install-recommends fuse3 libfuse2
+
           sudo modprobe fuse || true
           if [[ ! -c /dev/fuse ]]; then
             echo "FUSE is unavailable: /dev/fuse is missing." >&2
@@ -95,15 +108,11 @@ jobs:
           if ! command -v fusermount >/dev/null 2>&1; then
             sudo ln -sf "$(command -v fusermount3)" /usr/local/bin/fusermount
           fi
-          echo "XDG_RUNTIME_DIR=${RUNNER_TEMP}/xdg-runtime" >> "${GITHUB_ENV}"
-          mkdir -p "${XDG_RUNTIME_DIR}"
-          chmod 0700 "${XDG_RUNTIME_DIR}"
+          runtime_dir="${RUNNER_TEMP}/xdg-runtime"
+          mkdir -p "${runtime_dir}"
+          chmod 0700 "${runtime_dir}"
+          echo "XDG_RUNTIME_DIR=${runtime_dir}" >> "${GITHUB_ENV}"
 
-      - name: Install latest pkgforge appimagetool
-        id: appimagetool
-        if: steps.release.outputs.should_build == 'true'
-        run: |
-          set -euo pipefail
           tag="$(gh api repos/pkgforge-dev/appimagetool/releases/latest --jq '.tag_name')"
           url="https://github.com/pkgforge-dev/appimagetool/releases/download/${tag}/appimagetool-x86_64-linux"
           curl --fail --location --silent --show-error \
@@ -114,10 +123,7 @@ jobs:
           echo "version=${tag}" >> "${GITHUB_OUTPUT}"
           echo "Using pkgforge appimagetool ${tag}"
 
-      - name: Download and extract VSCodium
-        if: steps.release.outputs.should_build == 'true'
-        env:
-          VERSION: ${{ steps.release.outputs.version }}
+      - name: Download and prepare VSCodium AppDir
         run: |
           set -euo pipefail
           deb="${RUNNER_TEMP}/codium_${VERSION}_amd64.deb"
@@ -125,31 +131,26 @@ jobs:
           curl --fail --location --silent --show-error \
             --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 30 \
             --output "${deb}" "${url}"
+
           appdir="${GITHUB_WORKSPACE}/AppDir"
           mkdir -p "${appdir}"
           dpkg-deb -x "${deb}" "${appdir}"
 
-      - name: Prepare AppDir
-        if: steps.release.outputs.should_build == 'true'
-        run: |
-          set -euo pipefail
-          appdir="${GITHUB_WORKSPACE}/AppDir"
-          required_files=(
-            "${appdir}/usr/share/applications/com.visualstudio.CodeOSS.desktop"
-            "${appdir}/usr/share/pixmaps/vscodium.png"
-            "${appdir}/usr/share/codium/bin/codium"
-          )
-          for f in "${required_files[@]}"; do
-            [[ -f "${f}" ]] || { echo "Missing: ${f}" >&2; exit 1; }
+          desktop="${appdir}/usr/share/applications/com.visualstudio.CodeOSS.desktop"
+          icon="${appdir}/usr/share/pixmaps/vscodium.png"
+          codium="${appdir}/usr/share/codium/bin/codium"
+          for file in "${desktop}" "${icon}" "${codium}"; do
+            [[ -f "${file}" ]] || { echo "Missing required file: ${file}" >&2; exit 1; }
           done
+
           awk '
             /^Exec=/    { sub(/^Exec=[^[:space:]]+/, "Exec=AppRun") }
             /^TryExec=/ { $0 = "TryExec=AppRun" }
             /^Icon=/    { $0 = "Icon=codium" }
             /^Path=/    { next }
                         { print }
-          ' "${required_files[0]}" > "${appdir}/codium.desktop"
-          install -m 0644 "${required_files[1]}" "${appdir}/codium.png"
+          ' "${desktop}" > "${appdir}/codium.desktop"
+          install -m 0644 "${icon}" "${appdir}/codium.png"
           ln -sfn codium.png "${appdir}/.DirIcon"
           cat > "${appdir}/AppRun" <<'EOF'
           #!/bin/sh
@@ -160,11 +161,8 @@ jobs:
           EOF
           chmod 0755 "${appdir}/AppRun"
 
-      - name: Build AppImage
-        if: steps.release.outputs.should_build == 'true'
-        id: build
+      - name: Build AppImage and checksums
         env:
-          VERSION: ${{ steps.release.outputs.version }}
           APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
         run: |
           set -euo pipefail
@@ -175,17 +173,18 @@ jobs:
           repo="${GITHUB_REPOSITORY#*/}"
           update_info="gh-releases-zsync|${owner}|${repo}|latest|*-x86_64.AppImage.zsync"
           mkdir -p "${dist}"
+
           APPIMAGE_ARCH=x86_64 ARCH=x86_64 VERSION="${VERSION}" \
-            appimagetool --verbose \
+            appimagetool \
               --optimize-launch \
               --profile-timeout 45 \
               --dwarfs-profile "${profile}" \
               --update-info "${update_info}" \
               "${appdir}" \
               --output "${dist}"
-          if [[ ! -s "${profile}" ]]; then
-            echo "DWARFS profile not generated." >&2; exit 1
-          fi
+
+          [[ -s "${profile}" ]] || { echo "DWARFS profile not generated." >&2; exit 1; }
+          [[ -s "${dist}/appinfo" ]] || { echo "appinfo not generated." >&2; exit 1; }
           shopt -s nullglob
           images=("${dist}"/*.AppImage)
           zsyncs=("${dist}"/*.AppImage.zsync)
@@ -195,7 +194,8 @@ jobs:
           if [[ "${#zsyncs[@]}" -ne 1 || ! -s "${zsyncs[0]}" ]]; then
             echo "Expected exactly one non-empty .zsync file." >&2; exit 1
           fi
-          (cd "${dist}" && sha256sum *.AppImage *.AppImage.zsync appinfo > SHA256SUMS)
+
+          (cd "${dist}" && sha256sum "${images[0]}" "${zsyncs[0]}" appinfo > SHA256SUMS)
           {
             echo "### VSCodium ${VERSION} AppImage"
             echo ""
@@ -209,10 +209,10 @@ jobs:
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Publish GitHub release
-        if: steps.release.outputs.should_build == 'true'
         env:
-          VERSION: ${{ steps.release.outputs.version }}
-          RELEASE_EXISTS: ${{ steps.release.outputs.release_exists }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_EXISTS: ${{ needs.resolve.outputs.release_exists }}
           APPIMAGETOOL_VERSION: ${{ steps.appimagetool.outputs.version }}
         run: |
           set -euo pipefail
@@ -226,6 +226,7 @@ jobs:
           - Includes the AppImage, zsync metadata, appinfo, and SHA-256 checksums.
           EOF
           )"
+
           if [[ "${RELEASE_EXISTS}" == true ]]; then
             gh release upload "${VERSION}" "${dist}"/* --clobber
             gh release edit "${VERSION}" --title "${title}" --notes "${notes}"
